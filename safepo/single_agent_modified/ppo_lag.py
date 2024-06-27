@@ -21,10 +21,10 @@ import random
 import sys
 import time
 from collections import deque
-from typing import Callable
+import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 import numpy as np
-import wandb
 
 try:
     from isaacgym import gymutil
@@ -34,9 +34,8 @@ import torch
 import torch.nn as nn
 import torch.optim
 from torch.nn.utils.clip_grad import clip_grad_norm_
+from torch.optim.lr_scheduler import LinearLR
 from torch.utils.data import DataLoader, TensorDataset
-
-from torch.utils.tensorboard import SummaryWriter
 
 from safepo.common.buffer import VectorizedOnPolicyBuffer
 from safepo.common.env import make_sa_mujoco_env, make_sa_isaac_env
@@ -45,22 +44,19 @@ from safepo.common.logger import EpochLogger
 from safepo.common.model import ActorVCritic
 from safepo.utils.config import single_agent_args, isaac_gym_map, parse_sim_params
 
-CONJUGATE_GRADIENT_ITERS = 15
-TRPO_SEARCHING_STEPS = 15
 
 default_cfg = {
     "hidden_sizes": [64, 64],
     "gamma": 0.99,
-    "target_kl": 0.01,
-    "batch_size": 128,
-    "learning_iters": 10,
+    "target_kl": 0.02,
+    "batch_size": 64,
+    "learning_iters": 40,
     "max_grad_norm": 40.0,
-    "use_wandb": False,
 }
 
 isaac_gym_specific_cfg = {
     "total_steps": 100000000,
-    "steps_per_epoch": 20000,
+    "steps_per_epoch": 32768,
     "hidden_sizes": [1024, 1024, 512],
     "gamma": 0.96,
     "target_kl": 0.016,
@@ -70,98 +66,6 @@ isaac_gym_specific_cfg = {
     "max_grad_norm": 1.0,
     "use_critic_norm": False,
 }
-
-
-def get_flat_params_from(model: torch.nn.Module) -> torch.Tensor:
-    flat_params = []
-    for _, param in model.named_parameters():
-        if param.requires_grad:
-            data = param.data
-            data = data.view(-1)  # flatten tensor
-            flat_params.append(data)
-    assert flat_params, "No gradients were found in model parameters."
-    return torch.cat(flat_params)
-
-
-def conjugate_gradients(
-    fisher_product: Callable[[torch.Tensor], torch.Tensor],
-    policy: ActorVCritic,
-    fvp_obs: torch.Tensor,
-    vector_b: torch.Tensor,
-    num_steps: int = 10,
-    residual_tol: float = 1e-10,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    vector_x = torch.zeros_like(vector_b)
-    vector_r = vector_b - fisher_product(vector_x, policy, fvp_obs)
-    vector_p = vector_r.clone()
-    rdotr = torch.dot(vector_r, vector_r)
-
-    for _ in range(num_steps):
-        vector_z = fisher_product(vector_p, policy, fvp_obs)
-        alpha = rdotr / (torch.dot(vector_p, vector_z) + eps)
-        vector_x += alpha * vector_p
-        vector_r -= alpha * vector_z
-        new_rdotr = torch.dot(vector_r, vector_r)
-        if torch.sqrt(new_rdotr) < residual_tol:
-            break
-        vector_mu = new_rdotr / (rdotr + eps)
-        vector_p = vector_r + vector_mu * vector_p
-        rdotr = new_rdotr
-    return vector_x
-
-
-def set_param_values_to_model(model: torch.nn.Module, vals: torch.Tensor) -> None:
-    assert isinstance(vals, torch.Tensor)
-    i: int = 0
-    for _, param in model.named_parameters():
-        if param.requires_grad:  # param has grad and, hence, must be set
-            orig_size = param.size()
-            size = np.prod(list(param.size()))
-            new_values = vals[i : int(i + size)]
-            # set new param values
-            new_values = new_values.view(orig_size)
-            param.data = new_values
-            i += int(size)  # increment array position
-    assert i == len(vals), f"Lengths do not match: {i} vs. {len(vals)}"
-
-
-def get_flat_gradients_from(model: torch.nn.Module) -> torch.Tensor:
-    grads = []
-    for _, param in model.named_parameters():
-        if param.requires_grad and param.grad is not None:
-            grad = param.grad
-            grads.append(grad.view(-1))  # flatten tensor and append
-    assert grads, "No gradients were found in model parameters."
-    return torch.cat(grads)
-
-
-def fvp(
-    params: torch.Tensor,
-    policy: ActorVCritic,
-    fvp_obs: torch.Tensor,
-) -> torch.Tensor:
-    policy.actor.zero_grad()
-    current_distribution = policy.actor(fvp_obs)
-    with torch.no_grad():
-        old_distribution = policy.actor(fvp_obs)
-    kl = torch.distributions.kl.kl_divergence(
-        old_distribution, current_distribution
-    ).mean()
-
-    grads = torch.autograd.grad(kl, tuple(policy.actor.parameters()), create_graph=True)
-    flat_grad_kl = torch.cat([grad.view(-1) for grad in grads])
-
-    kl_p = (flat_grad_kl * params).sum()
-    grads = torch.autograd.grad(
-        kl_p,
-        tuple(policy.actor.parameters()),
-        retain_graph=False,
-    )
-
-    flat_grad_grad_kl = torch.cat([grad.contiguous().view(-1) for grad in grads])
-
-    return flat_grad_grad_kl + params * 0.1
 
 
 def main(args, cfg_env=None):
@@ -174,7 +78,7 @@ def main(args, cfg_env=None):
     device = torch.device(f"{args.device}:{args.device_id}")
 
     use_wandb = True
-    method_name = "trpo-lag"
+    method_name = "ppo-lag"
     run_id = method_name + f"-{args.seed}"
     if use_wandb:
         wandb_config = {
@@ -222,10 +126,18 @@ def main(args, cfg_env=None):
         act_dim=act_space.shape[0],
         hidden_sizes=config["hidden_sizes"],
     ).to(device)
-    reward_critic_optimizer = torch.optim.Adam(
-        policy.reward_critic.parameters(), lr=1e-3
+    actor_optimizer = torch.optim.Adam(policy.actor.parameters(), lr=3e-4)
+    actor_scheduler = LinearLR(
+        actor_optimizer,
+        start_factor=1.0,
+        end_factor=0.0,
+        total_iters=epochs,
+        verbose=False,
     )
-    cost_critic_optimizer = torch.optim.Adam(policy.cost_critic.parameters(), lr=1e-3)
+    reward_critic_optimizer = torch.optim.Adam(
+        policy.reward_critic.parameters(), lr=3e-4
+    )
+    cost_critic_optimizer = torch.optim.Adam(policy.cost_critic.parameters(), lr=3e-4)
 
     # create the vectorized on-policy buffer
     buffer = VectorizedOnPolicyBuffer(
@@ -293,7 +205,6 @@ def main(args, cfg_env=None):
                 for x in (next_obs, reward, cost, terminated, truncated)
             )
             global_step += args.num_envs
-
             if "final_observation" in info:
                 info["final_observation"] = np.array(
                     [
@@ -365,7 +276,6 @@ def main(args, cfg_env=None):
                                 "Metrics/EpLen": np.mean(len_deque),
                             }
                         )
-
                         ep_ret[idx] = 0.0
                         ep_cost[idx] = 0.0
                         ep_len[idx] = 0.0
@@ -420,115 +330,36 @@ def main(args, cfg_env=None):
 
         # update policy
         data = buffer.get()
-        fvp_obs = data["obs"][::1]
-        theta_old = get_flat_params_from(policy.actor)
-        policy.actor.zero_grad()
+        old_distribution = policy.actor(data["obs"])
 
         # comnpute advantage
         advantage = data["adv_r"] - lagrange.lagrangian_multiplier * data["adv_c"]
         advantage /= lagrange.lagrangian_multiplier + 1
 
-        # compute loss_pi
-        temp_distribution = policy.actor(data["obs"])
-        log_prob = temp_distribution.log_prob(data["act"]).sum(dim=-1)
-        ratio = torch.exp(log_prob - data["log_prob"])
-        loss_pi = -(ratio * advantage).mean()
-        loss_before = loss_pi.item()
-        old_distribution = policy.actor(data["obs"])
-
-        loss_pi.backward()
-
-        grads = -get_flat_gradients_from(policy.actor)
-        x = conjugate_gradients(fvp, policy, fvp_obs, grads, CONJUGATE_GRADIENT_ITERS)
-        assert torch.isfinite(x).all(), "x is not finite"
-        xHx = torch.dot(x, fvp(x, policy, fvp_obs))
-        assert xHx.item() >= 0, "xHx is negative"
-        alpha = torch.sqrt(2 * config["target_kl"] / (xHx + 1e-8))
-        step_direction = x * alpha
-        assert torch.isfinite(step_direction).all(), "step_direction is not finite"
-
-        step_frac = 1.0
-        # Change expected objective function gradient = expected_imrpove best this moment
-        expected_improve = grads.dot(step_direction)
-
-        final_kl = 0.0
-
-        # While not within_trust_region and not out of total_steps:
-        for step in range(TRPO_SEARCHING_STEPS):
-            # update theta params
-            new_theta = theta_old + step_frac * step_direction
-            # set new params as params of net
-            set_param_values_to_model(policy.actor, new_theta)
-
-            with torch.no_grad():
-                temp_distribution = policy.actor(data["obs"])
-                log_prob = temp_distribution.log_prob(data["act"]).sum(dim=-1)
-                ratio = torch.exp(log_prob - data["log_prob"])
-                loss_pi = -(ratio * advantage).mean()
-                # compute KL distance between new and old policy
-                current_distribution = policy.actor(data["obs"])
-                kl = (
-                    torch.distributions.kl.kl_divergence(
-                        old_distribution, current_distribution
-                    )
-                    .mean()
-                    .item()
-                )
-            # real loss improve: old policy loss - new policy loss
-            loss_improve = loss_before - loss_pi.item()
-            logger.log(
-                f"Expected Improvement: {expected_improve} Actual: {loss_improve}"
-            )
-            if not torch.isfinite(loss_pi):
-                logger.log("WARNING: loss_pi not finite")
-            elif loss_improve < 0:
-                logger.log("INFO: did not improve improve <0")
-            elif kl > config["target_kl"]:
-                logger.log("INFO: violated KL constraint.")
-            else:
-                # step only if surrogate is improved and when within trust reg.
-                acceptance_step = step + 1
-                logger.log(f"Accept step at i={acceptance_step}")
-                final_kl = kl
-                break
-            step_frac *= 0.8
-        else:
-            logger.log("INFO: no suitable step found...")
-            step_direction = torch.zeros_like(step_direction)
-            acceptance_step = 0
-
-        theta_new = theta_old + step_frac * step_direction
-        set_param_values_to_model(policy.actor, theta_new)
-
-        logger.store(
-            **{
-                "Misc/Alpha": alpha.item(),
-                "Misc/FinalStepNorm": torch.norm(step_direction).mean().item(),
-                "Misc/xHx": xHx.item(),
-                "Misc/gradient_norm": torch.norm(grads).mean().item(),
-                "Misc/H_inv_g": x.norm().item(),
-                "Misc/AcceptanceStep": acceptance_step,
-                "Loss/Loss_actor": loss_pi.mean().item(),
-                "Train/KL": final_kl,
-            },
-        )
-
         dataloader = DataLoader(
             dataset=TensorDataset(
                 data["obs"],
+                data["act"],
+                data["log_prob"],
                 data["target_value_r"],
                 data["target_value_c"],
+                advantage,
             ),
             batch_size=config.get(
                 "batch_size", args.steps_per_epoch // config.get("num_mini_batch", 1)
             ),
             shuffle=True,
         )
+        update_counts = 0
+        final_kl = torch.ones_like(old_distribution.loc)
         for _ in range(config["learning_iters"]):
             for (
                 obs_b,
+                act_b,
+                log_prob_b,
                 target_value_r_b,
                 target_value_c_b,
+                adv_b,
             ) in dataloader:
                 reward_critic_optimizer.zero_grad()
                 loss_r = nn.functional.mse_loss(
@@ -543,23 +374,44 @@ def main(args, cfg_env=None):
                         loss_r += param.pow(2).sum() * 0.001
                     for param in policy.cost_critic.parameters():
                         loss_c += param.pow(2).sum() * 0.001
+                distribution = policy.actor(obs_b)
+                log_prob = distribution.log_prob(act_b).sum(dim=-1)
+                ratio = torch.exp(log_prob - log_prob_b)
+                ratio_cliped = torch.clamp(ratio, 0.8, 1.2)
+                loss_pi = -torch.min(ratio * adv_b, ratio_cliped * adv_b).mean()
+                actor_optimizer.zero_grad()
                 total_loss = (
-                    2 * loss_r + loss_c
+                    loss_pi + 2 * loss_r + loss_c
                     if config.get("use_value_coefficient", False)
-                    else loss_r + loss_c
+                    else loss_pi + loss_r + loss_c
                 )
                 total_loss.backward()
                 clip_grad_norm_(policy.parameters(), config["max_grad_norm"])
                 reward_critic_optimizer.step()
                 cost_critic_optimizer.step()
+                actor_optimizer.step()
 
                 logger.store(
                     **{
                         "Loss/Loss_reward_critic": loss_r.mean().item(),
                         "Loss/Loss_cost_critic": loss_c.mean().item(),
+                        "Loss/Loss_actor": loss_pi.mean().item(),
                     }
                 )
+
+            new_distribution = policy.actor(data["obs"])
+            kl = (
+                torch.distributions.kl.kl_divergence(old_distribution, new_distribution)
+                .sum(-1, keepdim=True)
+                .mean()
+                .item()
+            )
+            final_kl = kl
+            update_counts += 1
+            if kl > config["target_kl"]:
+                break
         update_end_time = time.time()
+        actor_scheduler.step()
         if not logger.logged:
             # log data
             logger.log_tabular("Metrics/EpRet")
@@ -571,10 +423,12 @@ def main(args, cfg_env=None):
                 logger.log_tabular("Metrics/EvalEpLen")
             logger.log_tabular("Train/Epoch", epoch + 1)
             logger.log_tabular("Train/TotalSteps", (epoch + 1) * args.steps_per_epoch)
-            logger.log_tabular("Train/KL")
+            logger.log_tabular("Train/StopIter", update_counts)
+            logger.log_tabular("Train/KL", final_kl)
             logger.log_tabular(
                 "Train/LagragianMultiplier", lagrange.lagrangian_multiplier
             )
+            logger.log_tabular("Train/LR", actor_scheduler.get_last_lr()[0])
             logger.log_tabular("Loss/Loss_reward_critic")
             logger.log_tabular("Loss/Loss_cost_critic")
             logger.log_tabular("Loss/Loss_actor")
@@ -585,12 +439,6 @@ def main(args, cfg_env=None):
             logger.log_tabular("Time/Total", update_end_time - rollout_start_time)
             logger.log_tabular("Value/RewardAdv", data["adv_r"].mean().item())
             logger.log_tabular("Value/CostAdv", data["adv_c"].mean().item())
-            logger.log_tabular("Misc/Alpha")
-            logger.log_tabular("Misc/FinalStepNorm")
-            logger.log_tabular("Misc/xHx")
-            logger.log_tabular("Misc/gradient_norm")
-            logger.log_tabular("Misc/H_inv_g")
-            logger.log_tabular("Misc/AcceptanceStep")
 
             logger.dump_tabular()
             if (epoch + 1) % 100 == 0 or epoch == 0:

@@ -111,7 +111,6 @@ build-cpu:
 	docker build -t $(DOCKER_IMAGE_NAME) -f docker/cpu/Dockerfile .
 
 bash-gpu:
-	xhost +local:docker && \
 	docker run -it \
 		--gpus '"device=${GPU_ID}"' \
 		-v ${PWD}/workspace \
@@ -126,7 +125,6 @@ bash-gpu:
 		bash
 
 bash-cpu:
-	xhost +local:docker && \
 	docker run -it \
 		-v ${PWD}/workspace \
 		-v ${PWD}:/workspace/$(NAME) \
