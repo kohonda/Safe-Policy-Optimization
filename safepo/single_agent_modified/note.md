@@ -1,1 +1,1 @@
-python3 trpo_lag.py --task SafetyCarGoal1-v0 --seed 0 --num-envs 1 --total-steps 300000 --steps-per-epoch 1000
+python3 trpo_lag.py --task SafetyCarGoal2-v0 --seed 0 --num-envs 1 --total-steps 300000 --steps-per-epoch 1000
