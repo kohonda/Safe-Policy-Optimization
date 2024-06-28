@@ -171,6 +171,8 @@ def main(args, cfg_env=None):
     torch.set_num_threads(4)
     device = torch.device(f"{args.device}:{args.device_id}")
 
+    date = time.strftime("%Y-%m-%d-%H-%M-%S")
+
     use_wandb = True
     method_name = "cpo"
     run_id = method_name + f"-{args.seed}"
@@ -186,7 +188,7 @@ def main(args, cfg_env=None):
         run = wandb.init(
             project=project_name,
             entity="kohonda",
-            id=run_id,
+            id=run_id + f"-{date}",
             config=wandb_config,
             monitor_gym=True,
             sync_tensorboard=True,
@@ -285,6 +287,7 @@ def main(args, cfg_env=None):
                 torch.as_tensor(x, dtype=torch.float32, device=device)
                 for x in (next_obs, reward, cost, terminated, truncated)
             )
+            global_step += args.num_envs
             if "final_observation" in info:
                 info["final_observation"] = np.array(
                     [

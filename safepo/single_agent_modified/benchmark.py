@@ -8,9 +8,9 @@ import subprocess
 # vel_robots = ['Ant', 'HalfCheetah', 'Hopper', 'Walker2d', 'Swimmer', 'Humanoid']
 # vel_tasks = ['Velocity']
 
-navi_robots = ["Car"]
+navi_robots = ["Point", "Car"]
 navi_tasks = ["Goal"]
-diffculies = ["1", "2"]
+diffculies = ["2"]
 vel_robots = []
 vel_tasks = []
 
@@ -108,7 +108,7 @@ if __name__ == "__main__":
                             "--seed",
                             str(args.start_seed + 1000 * seed),
                             "--write-terminal",
-                            "True",
+                            "False",
                             "--experiment",
                             args.experiment,
                             "--total-steps",
